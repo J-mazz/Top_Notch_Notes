@@ -72,3 +72,5 @@ harness/build/tests/CMakeFiles/harness_tests.dir/test_telemetry.cpp.o
 harness/build/tests/CMakeFiles/harness_tests.dir/test_telemetry.cpp.o.ddi
 harness/build/tests/CMakeFiles/harness_tests.dir/test_telemetry.cpp.o.ddi.d
 harness/build/tests/CMakeFiles/harness_tests.dir/test_telemetry.cpp.o.modmap
+harness/build/CMakeFiles/harness_modules.dir/src/modules/audio.ixx.o.d
+pilot/pilot

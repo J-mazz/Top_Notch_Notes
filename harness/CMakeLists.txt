@@ -51,11 +51,9 @@ add_compile_options(
 # ============================================================================
 
 # miniaudio is header-only, included in our source
-# PocketSphinx for transcription (optional)
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(POCKETSPHINX pocketsphinx)
-endif()
+# PocketSphinx for transcription
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(POCKETSPHINX REQUIRED pocketsphinx)
 
 # Threads
 find_package(Threads REQUIRED)
@@ -87,11 +85,9 @@ target_link_libraries(harness_modules
         Threads::Threads
 )
 
-if(POCKETSPHINX_FOUND)
-    target_compile_definitions(harness_modules PUBLIC HAS_POCKETSPHINX)
-    target_include_directories(harness_modules PUBLIC ${POCKETSPHINX_INCLUDE_DIRS})
-    target_link_libraries(harness_modules PUBLIC ${POCKETSPHINX_LIBRARIES})
-endif()
+# PocketSphinx linking
+target_include_directories(harness_modules PUBLIC ${POCKETSPHINX_INCLUDE_DIRS})
+target_link_libraries(harness_modules PUBLIC ${POCKETSPHINX_LIBRARIES})
 
 # ============================================================================
 # Main Executable

@@ -1,6 +1,6 @@
 // ============================================================================
 // TopNotchNotes Harness - Transcription Module
-// Algorithmic speech-to-text processing
+// PocketSphinx-based speech-to-text processing
 // ============================================================================
 
 module;
@@ -17,6 +17,11 @@ module;
 #include <filesystem>
 #include <cmath>
 #include <print>
+#include <algorithm>
+
+// PocketSphinx headers
+#include <pocketsphinx.h>
+#include <sphinxbase/cmd_ln.h>
 
 export module harness:transcribe;
 
@@ -214,10 +219,8 @@ export namespace harness::transcribe
     };
 
     // ============================================================================
-    // PocketSphinx Integration (Optional)
+    // PocketSphinx Transcription Engine
     // ============================================================================
-
-#ifdef HAS_POCKETSPHINX
 
     class PocketSphinxEngine : public ITranscribeEngine
     {
@@ -225,17 +228,169 @@ export namespace harness::transcribe
         static std::expected<std::unique_ptr<PocketSphinxEngine>, std::string>
         create(const TranscribeConfig &config);
 
+        ~PocketSphinxEngine() override;
+
         [[nodiscard]] std::optional<TranscriptSegment> process(AudioFrame frame) override;
         [[nodiscard]] std::optional<TranscriptSegment> finalize() override;
         void reset() override;
         [[nodiscard]] bool is_ready() const noexcept override;
 
     private:
-        struct Impl;
-        std::unique_ptr<Impl> impl_;
+        explicit PocketSphinxEngine(ps_decoder_t* decoder, std::uint32_t sample_rate);
+        
+        ps_decoder_t* decoder_ = nullptr;
+        std::uint32_t sample_rate_ = 16000;
+        std::vector<std::int16_t> resample_buffer_;
+        std::size_t frame_count_ = 0;
+        bool utterance_started_ = false;
     };
 
-#endif // HAS_POCKETSPHINX
+    PocketSphinxEngine::PocketSphinxEngine(ps_decoder_t* decoder, std::uint32_t sample_rate)
+        : decoder_(decoder)
+        , sample_rate_(sample_rate)
+    {
+    }
+
+    PocketSphinxEngine::~PocketSphinxEngine() {
+        if (decoder_) {
+            ps_free(decoder_);
+        }
+    }
+
+    std::expected<std::unique_ptr<PocketSphinxEngine>, std::string>
+    PocketSphinxEngine::create(const TranscribeConfig &config) {
+        // Default model paths
+        const char* hmm_path = "/usr/share/pocketsphinx/model/en-us/en-us";
+        const char* lm_path = "/usr/share/pocketsphinx/model/en-us/en-us.lm.bin";
+        const char* dict_path = "/usr/share/pocketsphinx/model/en-us/cmudict-en-us.dict";
+        
+        // Override with custom paths if provided
+        std::string custom_hmm, custom_dict;
+        if (!config.model_path.empty()) {
+            custom_hmm = config.model_path.string();
+            hmm_path = custom_hmm.c_str();
+        }
+        if (!config.dictionary_path.empty()) {
+            custom_dict = config.dictionary_path.string();
+            dict_path = custom_dict.c_str();
+        }
+
+        // Create command-line configuration using SphinxBase
+        cmd_ln_t* ps_cfg = cmd_ln_init(nullptr, ps_args(), TRUE,
+            "-hmm", hmm_path,
+            "-lm", lm_path,
+            "-dict", dict_path,
+            "-logfn", "/dev/null",  // Suppress verbose logging
+            nullptr);
+        
+        if (!ps_cfg) {
+            return std::unexpected("Failed to create PocketSphinx config");
+        }
+
+        // Create decoder
+        ps_decoder_t* decoder = ps_init(ps_cfg);
+        
+        if (!decoder) {
+            cmd_ln_free_r(ps_cfg);
+            return std::unexpected("Failed to initialize PocketSphinx decoder - check model paths");
+        }
+
+        auto engine = std::unique_ptr<PocketSphinxEngine>(
+            new PocketSphinxEngine(decoder, config.sample_rate)
+        );
+        
+        std::print("PocketSphinx engine initialized (sample_rate={})\n", config.sample_rate);
+        return engine;
+    }
+
+    std::optional<TranscriptSegment> PocketSphinxEngine::process(AudioFrame frame) {
+        if (!decoder_ || frame.empty()) {
+            return std::nullopt;
+        }
+
+        // Start utterance if not already started
+        if (!utterance_started_) {
+            if (ps_start_utt(decoder_) < 0) {
+                std::print(stderr, "Failed to start utterance\n");
+                return std::nullopt;
+            }
+            utterance_started_ = true;
+        }
+
+        // Convert float [-1,1] to int16
+        resample_buffer_.resize(frame.size());
+        std::transform(frame.begin(), frame.end(), resample_buffer_.begin(),
+            [](float s) -> std::int16_t {
+                return static_cast<std::int16_t>(std::clamp(s, -1.0f, 1.0f) * 32767.0f);
+            });
+
+        // Process audio
+        if (ps_process_raw(decoder_, resample_buffer_.data(), 
+                           resample_buffer_.size(), FALSE, FALSE) < 0) {
+            std::print(stderr, "Failed to process audio\n");
+            return std::nullopt;
+        }
+
+        ++frame_count_;
+
+        // Check for hypothesis periodically (every ~0.5s at typical frame rates)
+        if (frame_count_ % 25 == 0) {
+            const char* hyp = ps_get_hyp(decoder_, nullptr);
+            if (hyp && hyp[0] != '\0') {
+                auto now = std::chrono::milliseconds(frame_count_ * 20);
+                return TranscriptSegment{
+                    .words = {{
+                        .text = hyp,
+                        .start_time = std::chrono::milliseconds(0),
+                        .end_time = now,
+                        .confidence = 0.8f
+                    }},
+                    .start_time = std::chrono::milliseconds(0),
+                    .end_time = now
+                };
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    std::optional<TranscriptSegment> PocketSphinxEngine::finalize() {
+        if (!decoder_ || !utterance_started_) {
+            return std::nullopt;
+        }
+
+        ps_end_utt(decoder_);
+        utterance_started_ = false;
+
+        const char* hyp = ps_get_hyp(decoder_, nullptr);
+        if (hyp && hyp[0] != '\0') {
+            auto end_time = std::chrono::milliseconds(frame_count_ * 20);
+            return TranscriptSegment{
+                .words = {{
+                    .text = hyp,
+                    .start_time = std::chrono::milliseconds(0),
+                    .end_time = end_time,
+                    .confidence = 0.9f
+                }},
+                .start_time = std::chrono::milliseconds(0),
+                .end_time = end_time
+            };
+        }
+
+        return std::nullopt;
+    }
+
+    void PocketSphinxEngine::reset() {
+        if (decoder_ && utterance_started_) {
+            ps_end_utt(decoder_);
+            utterance_started_ = false;
+        }
+        frame_count_ = 0;
+    }
+
+    bool PocketSphinxEngine::is_ready() const noexcept {
+        return decoder_ != nullptr;
+    }
 
     // ============================================================================
     // Factory Function
@@ -245,19 +400,12 @@ export namespace harness::transcribe
     [[nodiscard]] inline std::unique_ptr<ITranscribeEngine>
     create_engine(const TranscribeConfig &config)
     {
-#ifdef HAS_POCKETSPHINX
-        if (!config.model_path.empty())
-        {
-            auto result = PocketSphinxEngine::create(config);
-            if (result)
-            {
-                return std::move(*result);
-            }
-            std::print(stderr, "Failed to create PocketSphinx engine: {}\n", result.error());
+        // Try PocketSphinx first
+        auto result = PocketSphinxEngine::create(config);
+        if (result) {
+            return std::move(*result);
         }
-#else
-        (void)config;
-#endif
+        std::print(stderr, "PocketSphinx failed: {} - falling back to stub\n", result.error());
 
         // Fallback to stub engine
         return std::make_unique<StubTranscribeEngine>();
